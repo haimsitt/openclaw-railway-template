@@ -1112,6 +1112,121 @@ function createTuiWebSocketServer(httpServer) {
   return wss;
 }
 
+
+// ---------------------------------------------------------------------------
+// Gateway proxy access control.
+//
+// The wrapper injects OPENCLAW_GATEWAY_TOKEN into everything it proxies, so any
+// caller that reaches the proxy unauthenticated is a full gateway operator.
+// These helpers decide who is allowed through, and who gets the token injected.
+// ---------------------------------------------------------------------------
+
+// Guarded by OpenClaw's own hook token; must stay reachable anonymously.
+const OPEN_PROXY_PATHS = [/^\/hooks\//];
+
+// Operator control plane. Reachable only with a real gateway bearer token, so a
+// logged-in browser tab can never be used to drive them.
+const BEARER_ONLY_PROXY_PATHS = [/^\/api\/v1\/admin\/rpc/, /^\/api\/diagnostics\//];
+
+// Never inject the operator token: these callers authenticate themselves.
+const NO_INJECT_PROXY_PATHS = [...OPEN_PROXY_PATHS, ...BEARER_ONLY_PROXY_PATHS];
+
+const WRAPPER_AUTH_COOKIE = "ocw_auth";
+
+function proxyPathOf(url) {
+  const raw = url ?? "";
+  const q = raw.indexOf("?");
+  return q === -1 ? raw : raw.slice(0, q);
+}
+
+function matchesAny(patterns, pathname) {
+  return patterns.some((re) => re.test(pathname));
+}
+
+// Hash both sides so timingSafeEqual never sees mismatched lengths.
+function secretsMatch(a, b) {
+  const left = crypto.createHash("sha256").update(String(a ?? "")).digest();
+  const right = crypto.createHash("sha256").update(String(b ?? "")).digest();
+  return crypto.timingSafeEqual(left, right);
+}
+
+function hasGatewayBearer(req) {
+  if (!OPENCLAW_GATEWAY_TOKEN) return false;
+  const [scheme, value] = (req.headers.authorization || "").split(" ");
+  if (scheme !== "Bearer" || !value) return false;
+  return secretsMatch(value, OPENCLAW_GATEWAY_TOKEN);
+}
+
+function wrapperCookieValue() {
+  return crypto
+    .createHmac("sha256", String(SETUP_PASSWORD))
+    .update("openclaw-wrapper-v1")
+    .digest("hex");
+}
+
+function hasWrapperCookie(req) {
+  if (!SETUP_PASSWORD) return false;
+  const match = /(?:^|;\s*)ocw_auth=([a-f0-9]{64})/.exec(req.headers.cookie || "");
+  return match ? secretsMatch(match[1], wrapperCookieValue()) : false;
+}
+
+function hasSetupBasic(req) {
+  if (!SETUP_PASSWORD) return false;
+  const [scheme, encoded] = (req.headers.authorization || "").split(" ");
+  if (scheme !== "Basic" || !encoded) return false;
+  const decoded = Buffer.from(encoded, "base64").toString("utf8");
+  const idx = decoded.indexOf(":");
+  return secretsMatch(idx >= 0 ? decoded.slice(idx + 1) : "", SETUP_PASSWORD);
+}
+
+// True when the caller may reach the gateway at all.
+function proxyCallerIsAllowed(req, pathname) {
+  if (matchesAny(OPEN_PROXY_PATHS, pathname)) return true;
+  if (hasGatewayBearer(req)) return true;
+  if (matchesAny(BEARER_ONLY_PROXY_PATHS, pathname)) return false;
+  return hasWrapperCookie(req) || hasSetupBasic(req);
+}
+
+function requireGatewayAuth(req, res, next) {
+  const pathname = proxyPathOf(req.url);
+
+  if (matchesAny(OPEN_PROXY_PATHS, pathname)) return next();
+  if (hasGatewayBearer(req)) return next();
+
+  // Control-plane paths are invisible without a bearer token — 404, not 401, so
+  // their existence is not advertised to anonymous callers.
+  if (matchesAny(BEARER_ONLY_PROXY_PATHS, pathname)) {
+    return res.status(404).type("text/plain").send("Not Found");
+  }
+
+  if (!SETUP_PASSWORD) {
+    log.error("proxy", "SETUP_PASSWORD is not set; refusing to proxy to the gateway");
+    return res
+      .status(503)
+      .type("text/plain")
+      .send("SETUP_PASSWORD is not set. Set it in Railway Variables to use this instance.");
+  }
+
+  if (hasWrapperCookie(req)) return next();
+
+  if (hasSetupBasic(req)) {
+    // Browsers do not reliably send Basic credentials on a WebSocket handshake,
+    // but they do send cookies — and the Control UI needs the upgrade to work.
+    res.append(
+      "Set-Cookie",
+      `${WRAPPER_AUTH_COOKIE}=${wrapperCookieValue()}; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=604800`,
+    );
+    return next();
+  }
+
+  const ip = req.socket?.remoteAddress || "unknown";
+  if (setupRateLimiter.isRateLimited(ip)) {
+    return res.status(429).type("text/plain").send("Too many requests. Try again later.");
+  }
+  res.set("WWW-Authenticate", 'Basic realm="OpenClaw"');
+  return res.status(401).type("text/plain").send("Auth required");
+}
+
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
@@ -1142,16 +1257,26 @@ const PROXY_ORIGIN = process.env.RAILWAY_PUBLIC_DOMAIN
   : GATEWAY_TARGET;
 
 proxy.on("proxyReq", (proxyReq, req, res) => {
-  if (!req.url?.startsWith("/hooks/")) {
+  const pathname = proxyPathOf(req.url);
+  // Self-authenticating callers keep their own credentials: hooks carry the hook
+  // token, control-plane callers carry a real gateway bearer. Injecting here is
+  // what would make those paths reachable by anyone.
+  const selfAuthenticating =
+    matchesAny(NO_INJECT_PROXY_PATHS, pathname) || hasGatewayBearer(req);
+  if (!selfAuthenticating) {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
-  proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  if (!hasGatewayBearer(req)) {
+    proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
+  }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
 });
+
+app.use(requireGatewayAuth);
 
 app.use(async (req, res) => {
   if (!isConfigured() && !req.path.startsWith("/setup")) {
@@ -1240,6 +1365,15 @@ server.on("upgrade", async (req, socket, head) => {
     socket.destroy();
     return;
   }
+
+  if (!proxyCallerIsAllowed(req, url.pathname)) {
+    socket.write(
+      'HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm="OpenClaw"\r\n\r\n',
+    );
+    socket.destroy();
+    return;
+  }
+
   try {
     await ensureGatewayRunning();
   } catch (err) {
