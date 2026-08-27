@@ -1267,6 +1267,20 @@ proxy.on("proxyReq", (proxyReq, req, res) => {
     proxyReq.setHeader("Authorization", `Bearer ${OPENCLAW_GATEWAY_TOKEN}`);
   }
   proxyReq.setHeader("Origin", PROXY_ORIGIN);
+
+  // express.json() upstream of this proxy has already drained the request
+  // stream, so http-proxy forwards a POST whose body never arrives and the
+  // gateway eventually hangs up the socket. Re-send what was parsed.
+  //
+  // Only GETs reached the gateway before the OpenResponses endpoint was
+  // enabled, which is why this stayed invisible: it cannot affect a request
+  // that has no body.
+  if (req.body && typeof req.body === "object" && Object.keys(req.body).length > 0) {
+    const body = Buffer.from(JSON.stringify(req.body));
+    proxyReq.setHeader("Content-Type", "application/json");
+    proxyReq.setHeader("Content-Length", String(body.length));
+    proxyReq.write(body);
+  }
 });
 
 proxy.on("proxyReqWs", (proxyReq, req, socket, options, head) => {
