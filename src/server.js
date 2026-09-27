@@ -1227,13 +1227,26 @@ function requireGatewayAuth(req, res, next) {
   return res.status(401).type("text/plain").send("Auth required");
 }
 
+// A chat turn is one model run plus every tool call it makes, and a busy one
+// runs for minutes: an agent asked to sweep four systems does a dozen round
+// trips before it says anything. The caller owns the deadline — company-brain
+// aborts a turn at five minutes — so this is a backstop, not the budget.
+//
+// At 120_000 it WAS the budget, for every caller, on every route. A turn that
+// passed two minutes was torn down here mid-run; the gateway logged
+// `HTTP client disconnected` and the caller got something that does not say
+// "took too long": `502 Application failed to respond` from Railway's edge on
+// the public host, the 503 loading page on the private one. Neither is
+// retried, and the run's work is lost. Seen 2026-09-27 on a real chat turn.
+const PROXY_TIMEOUT_MS = Number.parseInt(process.env.PROXY_TIMEOUT_MS ?? "600000", 10);
+
 const proxy = httpProxy.createProxyServer({
   target: GATEWAY_TARGET,
   ws: true,
   xfwd: true,
   changeOrigin: true,
-  proxyTimeout: 120_000,
-  timeout: 120_000,
+  proxyTimeout: PROXY_TIMEOUT_MS,
+  timeout: PROXY_TIMEOUT_MS,
 });
 
 proxy.on("error", (err, _req, res) => {
