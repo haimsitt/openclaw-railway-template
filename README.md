@@ -53,6 +53,10 @@ This template exposes your OpenClaw gateway to the public internet.
 - `ENABLE_WEB_TUI=false`
 - `TUI_IDLE_TIMEOUT_MS=300000`
 - `TUI_MAX_SESSION_MS=1800000`
+- `PROXY_TIMEOUT_MS=600000` — how long the proxy will hold a request open to the
+  gateway. An agent turn is one model run plus its tool calls and can take
+  minutes; set this above whatever deadline your caller enforces, so the
+  caller's own timeout is what ends a slow turn and reports it.
 
 ## Day-1 Setup Checklist
 
