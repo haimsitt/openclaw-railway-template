@@ -13,7 +13,11 @@ RUN apt-get update \
     tini \
   && rm -rf /var/lib/apt/lists/*
 
-RUN npm install -g openclaw@latest clawhub@latest
+# Pinned: a rebuild must never change the gateway underneath a brain. Bump it
+# on purpose, after reading the release notes; a Railway variable of the same
+# name overrides it for one service.
+ARG OPENCLAW_VERSION=2026.9.6
+RUN npm install -g openclaw@${OPENCLAW_VERSION} clawhub@latest
 
 # Backward-compatibility shim for older OPENCLAW_ENTRY values.
 RUN mkdir -p /openclaw \

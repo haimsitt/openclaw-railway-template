@@ -163,7 +163,7 @@ Edit `buildOnboardArgs()` (src/server.js:442-496) to add new CLI flags or auth p
 - Template must mount a volume at `/data`
 - Must set `SETUP_PASSWORD` in Railway Variables
 - Public networking must be enabled (assigns `*.up.railway.app` domain)
-- OpenClaw is installed via `npm install -g openclaw@latest` during Docker build
+- OpenClaw is installed from npm at the version pinned by `ARG OPENCLAW_VERSION` in the Dockerfile (see docs/OPENCLAW-VERSION-CONTROL.md)
 
 ## Serena Semantic Coding
 
