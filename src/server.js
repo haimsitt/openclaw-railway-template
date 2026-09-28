@@ -9,6 +9,8 @@ import httpProxy from "http-proxy";
 import pty from "node-pty";
 import { WebSocketServer } from "ws";
 
+import { reclaimForeignGatewayLease } from "./gateway-lease.js";
+
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
   process.env.OPENCLAW_STATE_DIR?.trim() ||
@@ -217,6 +219,13 @@ async function startGateway() {
 
   const stopResult = await runCmd(OPENCLAW_NODE, clawArgs(["gateway", "stop"]));
   log.info("gateway", `stop existing gateway exit=${stopResult.code}`);
+
+  const lease = await reclaimForeignGatewayLease({ stateDir: STATE_DIR, hostname: os.hostname() });
+  if (lease.reclaimed) {
+    log.info("gateway", `reclaimed owner lease left by container ${lease.host} (last heartbeat ${lease.heartbeatAt})`);
+  } else if (lease.reason.startsWith("could not")) {
+    log.warn("gateway", `owner lease check: ${lease.reason}`);
+  }
 
   const args = [
     "gateway",
