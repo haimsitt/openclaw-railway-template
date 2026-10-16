@@ -10,6 +10,7 @@ import pty from "node-pty";
 import { WebSocketServer } from "ws";
 
 import { reclaimForeignGatewayLease } from "./gateway-lease.js";
+import { restartDelayMs, waitForReady } from "./gateway-start.js";
 
 const PORT = Number.parseInt(process.env.PORT ?? "8080", 10);
 const STATE_DIR =
@@ -175,38 +176,38 @@ async function syncAllowedOrigins() {
 let gatewayProc = null;
 let gatewayStarting = null;
 let shuttingDown = false;
+/** Exits since the gateway last became ready; sets how long the next auto-restart waits. */
+let gatewayFailures = 0;
+/**
+ * The boot-time `doctor --fix`, while it runs. Nothing starts the gateway
+ * before it settles: a gateway started beside it finds the state directory's
+ * lifecycle lock taken and exits 78 (brain-dipp, 2026-10-16). Resolved from
+ * the start when there is no boot repair to wait for.
+ */
+let bootRepair = Promise.resolve();
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-async function waitForGatewayReady(opts = {}) {
-  const timeoutMs = opts.timeoutMs ?? 60_000;
-  const start = Date.now();
-  const endpoints = ["/openclaw", "/openclaw", "/", "/health"];
-
-  while (Date.now() - start < timeoutMs) {
-    for (const endpoint of endpoints) {
-      try {
-        const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, {
-          method: "GET",
-        });
-        if (res) {
-          log.info("gateway", `ready at ${endpoint}`);
-          return true;
-        }
-      } catch (err) {
-        if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
-          const msg = err.code || err.message;
-          if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
-            log.warn("gateway", `health check error: ${msg}`);
-          }
+/** One round of readiness probes; true as soon as any endpoint answers at all. */
+async function probeGateway() {
+  for (const endpoint of ["/openclaw", "/openclaw", "/", "/health"]) {
+    try {
+      const res = await fetch(`${GATEWAY_TARGET}${endpoint}`, { method: "GET" });
+      if (res) {
+        log.info("gateway", `ready at ${endpoint}`);
+        return true;
+      }
+    } catch (err) {
+      if (err.code !== "ECONNREFUSED" && err.cause?.code !== "ECONNREFUSED") {
+        const msg = err.code || err.message;
+        if (msg !== "fetch failed" && msg !== "UND_ERR_CONNECT_TIMEOUT") {
+          log.warn("gateway", `health check error: ${msg}`);
         }
       }
     }
-    await sleep(250);
   }
-  log.error("gateway", `failed to become ready after ${timeoutMs / 1000} seconds`);
   return false;
 }
 
@@ -263,32 +264,63 @@ async function startGateway() {
     gatewayProc = null;
   });
 
-  gatewayProc.on("exit", (code, signal) => {
+  const proc = gatewayProc;
+  proc.on("exit", (code, signal) => {
     log.error("gateway", `exited code=${code} signal=${signal}`);
-    gatewayProc = null;
-    if (!shuttingDown && isConfigured()) {
-      log.info("gateway", "scheduling auto-restart in 2s...");
-      setTimeout(() => {
-        if (!shuttingDown && !gatewayProc && isConfigured()) {
-          ensureGatewayRunning().catch((err) => {
-            log.error("gateway", `auto-restart failed: ${err.message}`);
-          });
-        }
-      }, 2000);
-    }
+    if (gatewayProc === proc) gatewayProc = null;
+    // While a start is in progress, ensureGatewayRunning sees the exit and
+    // tries again itself; a second restart from here would race it.
+    if (gatewayStarting || shuttingDown || !isConfigured()) return;
+    gatewayFailures += 1;
+    const delay = restartDelayMs(gatewayFailures);
+    log.info("gateway", `scheduling auto-restart in ${delay / 1000}s...`);
+    setTimeout(() => {
+      if (!shuttingDown && !gatewayProc && isConfigured()) {
+        ensureGatewayRunning().catch((err) => {
+          log.error("gateway", `auto-restart failed: ${err.message}`);
+        });
+      }
+    }, delay);
   });
 }
 
+/**
+ * Starts the gateway once for everyone who asks, and resolves when it
+ * answers. A gateway that exits before it is ready is started again (with
+ * restartDelayMs between attempts) inside the same 60-second budget, so the
+ * callers waiting on it are served by the attempt that succeeds instead of
+ * failing with the one that died.
+ */
 async function ensureGatewayRunning() {
   if (!isConfigured()) return { ok: false, reason: "not configured" };
-  if (gatewayProc) return { ok: true };
+  if (gatewayProc && !gatewayStarting) return { ok: true };
   if (!gatewayStarting) {
     gatewayStarting = (async () => {
+      await bootRepair;
+      const deadline = Date.now() + 60_000;
       await syncAllowedOrigins();
-      await startGateway();
-      const ready = await waitForGatewayReady({ timeoutMs: 60_000 });
-      if (!ready) {
-        throw new Error("Gateway did not become ready in time");
+      for (let attempt = 1; ; attempt++) {
+        await startGateway();
+        const proc = gatewayProc;
+        const outcome = await waitForReady({
+          probe: probeGateway,
+          alive: () => proc !== null && gatewayProc === proc,
+          timeoutMs: Math.max(0, deadline - Date.now()),
+        });
+        if (outcome === "ready") {
+          gatewayFailures = 0;
+          return;
+        }
+        if (outcome === "timeout") {
+          log.error("gateway", "failed to become ready after 60 seconds");
+          throw new Error("Gateway did not become ready in time");
+        }
+        const delay = restartDelayMs(attempt);
+        if (shuttingDown || Date.now() + delay >= deadline) {
+          throw new Error("Gateway exited before it became ready");
+        }
+        log.warn("gateway", `exited while starting; starting again in ${delay / 1000}s (attempt ${attempt + 1})`);
+        await sleep(delay);
       }
     })().finally(() => {
       gatewayStarting = null;
@@ -1351,7 +1383,9 @@ const server = app.listen(PORT, () => {
   log.info("wrapper", `configured: ${isConfigured()}`);
 
   if (isConfigured()) {
-    (async () => {
+    // Set before anything can ask for the gateway: a request that arrives
+    // during the repair waits for it in ensureGatewayRunning.
+    bootRepair = (async () => {
       try {
         log.info("wrapper", "running openclaw doctor --fix...");
         const dr = await runCmd(OPENCLAW_NODE, clawArgs(["doctor", "--fix"]));
@@ -1360,8 +1394,8 @@ const server = app.listen(PORT, () => {
       } catch (err) {
         log.warn("wrapper", `doctor --fix failed: ${err.message}`);
       }
-      await ensureGatewayRunning();
-    })().catch((err) => {
+    })();
+    bootRepair.then(() => ensureGatewayRunning()).catch((err) => {
       log.error("wrapper", `failed to start gateway at boot: ${err.message}`);
     });
   }
