@@ -1167,7 +1167,14 @@ const OPEN_PROXY_PATHS = [/^\/hooks\//];
 
 // Operator control plane. Reachable only with a real gateway bearer token, so a
 // logged-in browser tab can never be used to drive them.
-const BEARER_ONLY_PROXY_PATHS = [/^\/api\/v1\/admin\/rpc/, /^\/api\/diagnostics\//];
+// The brain's own routes (the brain-files plugin's /api/brain/workspace-file) carry
+// people's private notes, and the company brain sends the bearer. A browser with
+// the setup password must not reach them with the token injected.
+const BEARER_ONLY_PROXY_PATHS = [
+  /^\/api\/v1\/admin\/rpc/,
+  /^\/api\/diagnostics\//,
+  /^\/api\/brain\//,
+];
 
 // Never inject the operator token: these callers authenticate themselves.
 const NO_INJECT_PROXY_PATHS = [...OPEN_PROXY_PATHS, ...BEARER_ONLY_PROXY_PATHS];
